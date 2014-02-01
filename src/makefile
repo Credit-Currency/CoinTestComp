@@ -4,42 +4,94 @@
 
 USE_UPNP:=0
 
-INCLUDEPATHS= \
- -I"C:\boost-1.49.0-mgw" \
- -I"C:\db-4.8.30.NC-mgw\build_unix" \
- -I"C:\openssl-1.0.1b-mgw\include"
+DEFS=-DUSE_IPV6 -DBOOST_SPIRIT_THREADSAFE
 
-LIBPATHS= \
- -L"C:\boost-1.49.0-mgw\stage\lib" \
- -L"C:\db-4.8.30.NC-mgw\build_unix" \
- -L"C:\openssl-1.0.1b-mgw"
-
-LIBS= \
- -l boost_system-mgw45-mt-s-1_49 \
- -l boost_filesystem-mgw45-mt-s-1_49 \
- -l boost_program_options-mgw45-mt-s-1_49 \
- -l boost_thread-mgw45-mt-s-1_49 \
- -l db_cxx \
- -l ssl \
- -l crypto
-
-DEFS=-DWIN32 -D_WINDOWS -DBOOST_THREAD_USE_LIB -DBOOST_SPIRIT_THREADSAFE -DUSE_IPV6
-DEBUGFLAGS=-g
-CFLAGS=-mthreads -O2 -w -Wall -Wextra -Wformat -Wformat-security -Wno-unused-parameter $(DEBUGFLAGS) $(DEFS) $(INCLUDEPATHS)
+DEFS += $(addprefix -I,$(CURDIR) $(CURDIR)/obj $(BOOST_INCLUDE_PATH) $(BDB_INCLUDE_PATH) $(OPENSSL_INCLUDE_PATH))
+LIBS = $(addprefix -L,$(BOOST_LIB_PATH) $(BDB_LIB_PATH) $(OPENSSL_LIB_PATH))
 
 TESTDEFS = -DTEST_DATA_DIR=$(abspath test/data)
 
-ifdef USE_UPNP
- INCLUDEPATHS += -I"C:\miniupnpc-1.6-mgw"
- LIBPATHS += -L"C:\miniupnpc-1.6-mgw"
- LIBS += -l miniupnpc -l iphlpapi
- DEFS += -DSTATICLIB -DUSE_UPNP=$(USE_UPNP)
+LMODE = dynamic
+LMODE2 = dynamic
+ifdef STATIC
+	LMODE = static
+	ifeq (${STATIC}, all)
+		LMODE2 = static
+	endif
+else
+	TESTDEFS += -DBOOST_TEST_DYN_LINK
 endif
 
-LIBS += -l kernel32 -l user32 -l gdi32 -l comdlg32 -l winspool -l winmm -l shell32 -l comctl32 -l ole32 -l oleaut32 -l uuid -l rpcrt4 -l advapi32 -l ws2_32 -l mswsock -l shlwapi
+# for boost 1.37, add -mt to the boost libraries
+LIBS += \
+ -Wl,-B$(LMODE) \
+   -l boost_system$(BOOST_LIB_SUFFIX) \
+   -l boost_filesystem$(BOOST_LIB_SUFFIX) \
+   -l boost_program_options$(BOOST_LIB_SUFFIX) \
+   -l boost_thread$(BOOST_LIB_SUFFIX) \
+   -l db_cxx$(BDB_LIB_SUFFIX) \
+   -l ssl \
+   -l crypto
 
-# TODO: make the mingw builds smarter about dependencies, like the linux/osx builds are
-HEADERS = $(wildcard *.h)
+ifndef USE_UPNP
+	override USE_UPNP = -
+endif
+ifneq (${USE_UPNP}, -)
+	LIBS += -l miniupnpc
+	DEFS += -DUSE_UPNP=$(USE_UPNP)
+endif
+
+LIBS+= \
+ -Wl,-B$(LMODE2) \
+   -l z \
+   -l dl \
+   -l pthread
+
+
+# Hardening
+# Make some classes of vulnerabilities unexploitable in case one is discovered.
+#
+    # This is a workaround for Ubuntu bug #691722, the default -fstack-protector causes
+    # -fstack-protector-all to be ignored unless -fno-stack-protector is used first.
+    # see: https://bugs.launchpad.net/ubuntu/+source/gcc-4.5/+bug/691722
+    HARDENING=-fno-stack-protector
+
+    # Stack Canaries
+    # Put numbers at the beginning of each stack frame and check that they are the same.
+    # If a stack buffer if overflowed, it writes over the canary number and then on return
+    # when that number is checked, it won't be the same and the program will exit with
+    # a "Stack smashing detected" error instead of being exploited.
+    HARDENING+=-fstack-protector-all -Wstack-protector
+
+    # Make some important things such as the global offset table read only as soon as
+    # the dynamic linker is finished building it. This will prevent overwriting of addresses
+    # which would later be jumped to.
+    LDHARDENING+=-Wl,-z,relro -Wl,-z,now
+
+    # Build position independent code to take advantage of Address Space Layout Randomization
+    # offered by some kernels.
+    # see doc/build-unix.txt for more information.
+    ifdef PIE
+        HARDENING+=-fPIE
+        LDHARDENING+=-pie
+    endif
+
+    # -D_FORTIFY_SOURCE=2 does some checking for potentially exploitable code patterns in
+    # the source such overflowing a statically defined buffer.
+    HARDENING+=-D_FORTIFY_SOURCE=2
+#
+
+
+DEBUGFLAGS=-g
+
+# CXXFLAGS can be specified on the make command line, so we use xCXXFLAGS that only
+# adds some defaults in front. Unfortunately, CXXFLAGS=... $(CXXFLAGS) does not work.
+xCXXFLAGS=-O2 -pthread -Wall -Wextra -Wformat -Wformat-security -Wno-unused-parameter \
+    $(DEBUGFLAGS) $(DEFS) $(HARDENING) $(CXXFLAGS)
+
+# LDFLAGS can be specified on the make command line, so we use xLDFLAGS that only
+# adds some defaults in front. Unfortunately, LDFLAGS=... $(LDFLAGS) does not work.
+xLDFLAGS=$(LDHARDENING) $(LDFLAGS)
 
 OBJS= \
     obj/version.o \
@@ -68,27 +120,48 @@ OBJS= \
     obj/noui.o
 
 
-all: credit.exe
+all: credit
+
+# auto-generated dependencies:
+-include obj/*.P
+-include obj-test/*.P
 
 obj/scrypt.o: scrypt.c
-	gcc -c $(CFLAGS) -o $@ $^
+	gcc -c -o $@ $^
 
-obj/%.o: %.cpp $(HEADERS)
-	g++ -c $(CFLAGS) -o $@ $<
+obj/build.h: FORCE
+	/bin/sh ../share/genbuild.sh obj/build.h
+version.cpp: obj/build.h
+DEFS += -DHAVE_BUILD_INFO
 
-credit.exe: $(OBJS:obj/%=obj/%)
-	g++ $(CFLAGS) -o $@ $(LIBPATHS) $^ $(LIBS)
+obj/%.o: %.cpp
+	$(CXX) -c $(xCXXFLAGS) -MMD -MF $(@:%.o=%.d) -o $@ $<
+	@cp $(@:%.o=%.d) $(@:%.o=%.P); \
+	  sed -e 's/#.*//' -e 's/^[^:]*: *//' -e 's/ *\\$$//' \
+	      -e '/^$$/ d' -e 's/$$/ :/' < $(@:%.o=%.d) >> $(@:%.o=%.P); \
+	  rm -f $(@:%.o=%.d)
+
+credit: $(OBJS:obj/%=obj/%)
+	$(CXX) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)
 
 TESTOBJS := $(patsubst test/%.cpp,obj-test/%.o,$(wildcard test/*.cpp))
 
-obj-test/%.o: test/%.cpp $(HEADERS)
-	g++ -c $(TESTDEFS) $(CFLAGS) -o $@ $<
+obj-test/%.o: test/%.cpp
+	$(CXX) -c $(TESTDEFS) $(xCXXFLAGS) -MMD -MF $(@:%.o=%.d) -o $@ $<
+	@cp $(@:%.o=%.d) $(@:%.o=%.P); \
+	  sed -e 's/#.*//' -e 's/^[^:]*: *//' -e 's/ *\\$$//' \
+	      -e '/^$$/ d' -e 's/$$/ :/' < $(@:%.o=%.d) >> $(@:%.o=%.P); \
+	  rm -f $(@:%.o=%.d)
 
-test_credit.exe: $(TESTOBJS) $(filter-out obj/init.o,$(OBJS:obj/%=obj/%))
-	g++ $(CFLAGS) -o $@ $(LIBPATHS) $^ -lboost_unit_test_framework $(LIBS)
+test_credit: $(TESTOBJS) $(filter-out obj/init.o,$(OBJS:obj/%=obj/%))
+	$(CXX) $(xCXXFLAGS) -o $@ $(LIBPATHS) $^ -Wl,-B$(LMODE) -lboost_unit_test_framework $(xLDFLAGS) $(LIBS)
 
 clean:
-	-del /Q credit test_credit
-	-del /Q obj\*
-	-del /Q obj-test\*
-	-del /Q build.h
+	-rm -f credit test_credit
+	-rm -f obj/*.o
+	-rm -f obj-test/*.o
+	-rm -f obj/*.P
+	-rm -f obj-test/*.P
+	-rm -f src/build.h
+
+FORCE:
